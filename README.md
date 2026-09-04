@@ -1,4 +1,4 @@
-# Agent Trust Layer — v2
+# Agent Trust Layer — 
 
 Track 01: AI Growth & Agentic Commerce
 
@@ -15,7 +15,7 @@ The Trust Layer sits between an AI buyer and Razorpay and produces a
 - Decision engine = ALLOW / REVIEW / BLOCK.
 - Only ALLOW reaches Razorpay automatically.
 
-## What changed in v2
+
 
 1. Purchase-only headline evaluation.
 2. Historical sessions create a real observed per-agent baseline.
