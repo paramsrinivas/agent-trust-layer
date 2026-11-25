@@ -1,84 +1,69 @@
-"""
-Payment Authorization Decision engine.
-
-This is the product boundary between a buyer agent and Razorpay.
-
-Design:
-    1. Hard policy violations -> BLOCK.
-    2. Policy passes + very high behavioral risk -> BLOCK.
-    3. Policy passes + elevated behavioral risk -> REVIEW.
-    4. Policy passes + low behavioral risk -> ALLOW.
-
-The engine does NOT invent feature explanations. Reasons come from
-deterministic policy evidence plus named behavioral signals derived from
-the actual feature values.
-
-Usage from the future live demo:
-    decision = authorize_purchase(...)
-    if decision.decision == "ALLOW":
-        # only here do we create a Razorpay test-mode order/payment
-        ...
-"""
+"""Payment Authorization Decision engine (hardened, policy-only BLOCK by default)."""
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Callable, Optional
+import math
+from typing import Any
 
-import numpy as np
 import pandas as pd
+
+from generator import extract_features, policy_check, requests_in_window
 from models import (
     AgentProfile,
     BehaviorResult,
     PaymentAuthorizationDecision,
-    PolicyResult,
     PurchaseRequest,
     Session,
 )
-from generator import extract_features, policy_check, requests_in_window
 
 
 class TrustModel:
-    """Small adapter around a fitted sklearn anomaly model."""
+    """Validated adapter around a fitted sklearn anomaly model."""
 
     def __init__(
         self,
-        model,
+        model: Any,
         feature_names: list[str],
         review_threshold: float,
         block_threshold: float,
     ):
+        if not feature_names:
+            raise ValueError("feature_names must be non-empty.")
+        review = float(review_threshold)
+        block = float(block_threshold)
+        if not (math.isfinite(review) and math.isfinite(block)):
+            raise ValueError("Thresholds must be finite numbers.")
+        if review > block:
+            raise ValueError(
+                f"review_threshold ({review}) cannot exceed block_threshold ({block})."
+            )
         self.model = model
-        self.feature_names = feature_names
-        self.review_threshold = float(review_threshold)
-        self.block_threshold = float(block_threshold)
+        self.feature_names = list(feature_names)
+        self.review_threshold = review
+        self.block_threshold = block
 
     def score(self, features: dict[str, float]) -> float:
-        vector = pd.DataFrame(
-            [[features[name] for name in self.feature_names]],
-            columns=self.feature_names,
-        )
-
+        row = []
+        for name in self.feature_names:
+            if name not in features:
+                raise KeyError(f"Missing required feature: {name!r}")
+            val = float(features[name])
+            if not math.isfinite(val):
+                raise ValueError(f"Feature {name!r} must be finite, got {val!r}")
+            row.append(val)
+        vector = pd.DataFrame([row], columns=self.feature_names)
         return float(-self.model.decision_function(vector)[0])
 
 
 def behavioral_reasons(
     features: dict[str, float],
     baseline,
-    mandate,
     risk: float,
     review_threshold: float,
     block_threshold: float,
 ) -> list[str]:
-    """
-    Human-readable evidence derived from real features.
+    reasons: list[str] = []
 
-    These are explanations, not fake SHAP values. We only show a reason when
-    a concrete observed feature is materially unusual.
-    """
-    reasons = []
-
-    # Velocity evidence.
     gap = features["time_since_previous_sec"]
     if gap < max(30.0, baseline.gap_mean_sec * 0.35):
         reasons.append(
@@ -92,7 +77,6 @@ def behavioral_reasons(
             "requests in the last 5 minutes)"
         )
 
-    # Price evidence.
     if abs(features["price_zscore"]) >= 3.0:
         direction = "above" if features["price_zscore"] > 0 else "below"
         reasons.append(
@@ -100,29 +84,26 @@ def behavioral_reasons(
             f"(z={features['price_zscore']:+.1f})"
         )
 
-    # Category evidence.
     if features["category_distance"] >= 0.67:
+        reasons.append("Product category is far from the agent's primary category")
+
+    if features.get("recent_category_distance", 0.0) >= 0.50:
         reasons.append(
-            "Product category is far from the agent's primary category"
+            "Product category drifted away from the agent's recent session trajectory "
+            f"(recent_distance={features['recent_category_distance']:.2f})"
         )
 
-    # Session spend evidence.
     if features["cumulative_spend_ratio"] >= 0.80:
         reasons.append(
             f"Session spend is at {features['cumulative_spend_ratio']:.0%} "
             "of the authorized budget"
         )
 
-    # Fallback so REVIEW/BLOCK always has a comprehensible reason.
     if not reasons:
         if risk >= block_threshold:
-            reasons.append(
-                "Behavioral risk exceeds the calibrated authorization limit"
-            )
+            reasons.append("Behavioral risk exceeds the calibrated authorization limit")
         elif risk >= review_threshold:
-            reasons.append(
-                "Behavior differs from the agent's learned behavioral baseline"
-            )
+            reasons.append("Behavior differs from the agent's learned behavioral baseline")
 
     return reasons
 
@@ -132,90 +113,67 @@ def authorize_purchase(
     session: Session,
     agent: AgentProfile,
     trust_model: TrustModel,
+    *,
+    razorpay_mode: str = "test",
+    ml_can_block: bool = False,
 ) -> PaymentAuthorizationDecision:
-    """
-    Authorize exactly one purchase request.
-
-    Only purchase steps can reach a payment authorization decision.
-    Non-purchase requests are rejected from this function rather than
-    accidentally creating a payment.
-    """
     if request.step.type != "purchase":
         raise ValueError(
             "authorize_purchase() accepts purchase steps only. "
             "Browsing/comparison requests cannot create payments."
         )
+    if agent.baseline is None:
+        raise ValueError(f"Agent {agent.agent_id!r} has no estimated BehavioralBaseline.")
+    if request.agent_id != agent.agent_id or session.agent_id != agent.agent_id:
+        raise ValueError("Agent identity mismatch between request, session, and agent profile.")
+    if request.session_id != session.session_id:
+        raise ValueError("Session ID mismatch between request and session.")
 
-    try:
-        idx = next(
-            i for i, r in enumerate(session.requests)
-            if r.request_id == request.request_id
+    matches = [i for i, r in enumerate(session.requests) if r.request_id == request.request_id]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected request_id {request.request_id!r} exactly once in session, found {len(matches)}."
         )
-    except StopIteration as exc:
-        raise ValueError("Request is not part of the supplied session") from exc
+    idx = matches[0]
+    canonical_request = session.requests[idx]
+    if canonical_request != request:
+        raise ValueError("Supplied request payload does not match canonical session request.")
 
-    # Use the immutable mandate snapshot belonging to this session.
     mandate = session.mandate_snapshot
-
     cumulative_spend = sum(
-        r.product.amount
-        for r in session.requests[:idx + 1]
-        if r.step.type == "purchase"
+        r.product.amount for r in session.requests[: idx + 1] if r.step.type == "purchase"
     )
-
-    requests_10m = requests_in_window(
-        idx,
-        session.requests,
-        10,
-    )
+    requests_10m = requests_in_window(idx, session.requests, 10)
 
     policy = policy_check(
-        request=request,
+        request=canonical_request,
         mandate=mandate,
         cumulative_spend_incl_this=cumulative_spend,
         requests_in_last_10m=requests_10m,
     )
-
     features = extract_features(
         idx=idx,
         session_requests=session.requests,
         mandate=mandate,
         baseline=agent.baseline,
     )
-
     risk = trust_model.score(features)
 
-    # Policy is authoritative for explicit authorization boundaries.
-    # The model adds behavioral evidence; it does not override a hard rule.
     if not policy.passed:
         decision = "BLOCK"
-        reasons = [
-            f"Policy violation: {violation.rule}"
-            for violation in policy.violations
-        ]
-
-    elif risk >= trust_model.block_threshold:
+        reasons = [f"Policy violation: {v.rule}" for v in policy.violations]
+    elif ml_can_block and risk >= trust_model.block_threshold:
         decision = "BLOCK"
         reasons = behavioral_reasons(
-            features,
-            agent.baseline,
-            mandate,
-            risk,
-            trust_model.review_threshold,
-            trust_model.block_threshold,
+            features, agent.baseline, risk,
+            trust_model.review_threshold, trust_model.block_threshold,
         )
-
     elif risk >= trust_model.review_threshold:
         decision = "REVIEW"
         reasons = behavioral_reasons(
-            features,
-            agent.baseline,
-            mandate,
-            risk,
-            trust_model.review_threshold,
-            trust_model.block_threshold,
+            features, agent.baseline, risk,
+            trust_model.review_threshold, trust_model.block_threshold,
         )
-
     else:
         decision = "ALLOW"
         reasons = ["Request is within policy and consistent with agent behavior"]
@@ -227,31 +185,19 @@ def authorize_purchase(
     )
 
     return PaymentAuthorizationDecision(
-        request_id=request.request_id,
-        agent_id=request.agent_id,
-        session_id=request.session_id,
+        request_id=canonical_request.request_id,
+        agent_id=canonical_request.agent_id,
+        session_id=canonical_request.session_id,
         decision=decision,
         policy=policy,
         behavior=behavior,
         reasons=reasons,
-        # Authorization is payment-aware now; actual order creation happens
-        # later and only after the ALLOW gate passes.
-        razorpay_mode="test",
+        razorpay_mode=razorpay_mode,
         razorpay_order_id=None,
     )
 
 
-def should_create_razorpay_order(decision: PaymentAuthorizationDecision) -> bool:
-    """
-    The single payment-side gate.
-
-    REVIEW and BLOCK must never automatically create a payment order.
-    """
-    return decision.decision == "ALLOW"
-
-
-def audit_event(decision: PaymentAuthorizationDecision) -> dict:
-    """Convert an authorization decision into a dashboard/audit-friendly event."""
+def audit_event(decision: PaymentAuthorizationDecision) -> dict[str, Any]:
     return {
         "request_id": decision.request_id,
         "agent_id": decision.agent_id,
@@ -260,20 +206,14 @@ def audit_event(decision: PaymentAuthorizationDecision) -> dict:
         "razorpay_mode": decision.razorpay_mode,
         "razorpay_order_id": decision.razorpay_order_id,
         "risk": round(decision.behavior.anomaly_score, 5),
+        "is_anomalous": decision.behavior.is_anomalous,
         "policy_passed": decision.policy.passed,
-        "policy_violations": [
-            v.rule for v in decision.policy.violations
-        ],
-        "reasons": decision.reasons,
+        "policy_violations": [v.rule for v in decision.policy.violations],
+        "reasons": list(decision.reasons),
         "amount": decision.behavior.features.get("amount"),
-        "category_distance": decision.behavior.features.get(
-            "category_distance"
-        ),
+        "category_distance": decision.behavior.features.get("category_distance"),
+        "recent_category_distance": decision.behavior.features.get("recent_category_distance"),
         "price_zscore": decision.behavior.features.get("price_zscore"),
-        "requests_last_5m": decision.behavior.features.get(
-            "requests_last_5m"
-        ),
-        "time_since_previous_sec": decision.behavior.features.get(
-            "time_since_previous_sec"
-        ),
+        "requests_last_5m": decision.behavior.features.get("requests_last_5m"),
+        "time_since_previous_sec": decision.behavior.features.get("time_since_previous_sec"),
     }

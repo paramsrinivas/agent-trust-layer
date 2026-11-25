@@ -1,8 +1,10 @@
-venv/
-.env
 __pycache__/
 *.pyc
+.env
 .DS_Store
-data/
-
-*.pkl
+data/idempotency.sqlite3*
+data/idempotency_store.json
+data/agents.json
+data/sessions.json
+data/features_*.csv
+data/experiments/scored_test_*.csv

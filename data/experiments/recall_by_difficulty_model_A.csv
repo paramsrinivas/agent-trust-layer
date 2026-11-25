@@ -1,0 +1,10 @@
+difficulty,system,recall,n_anomalous_purchases
+easy,Policy only,1.0,10
+easy,Model only,0.8,10
+easy,Policy + ML,1.0,10
+medium,Policy only,0.0,10
+medium,Model only,0.3,10
+medium,Policy + ML,0.3,10
+hard,Policy only,0.0,10
+hard,Model only,1.0,10
+hard,Policy + ML,1.0,10
